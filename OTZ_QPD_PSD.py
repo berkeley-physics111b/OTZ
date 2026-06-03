@@ -43,6 +43,8 @@ import matplotlib.gridspec as gridspec
 from matplotlib.animation import FuncAnimation
 from matplotlib.widgets import Button
 
+from pathlib import Path
+
 # ---------------------------------------------------------------------------
 # Hardware driver
 # ---------------------------------------------------------------------------
@@ -61,7 +63,7 @@ XY_COL      = "#2ca02c"   # green
 CONFIRM_COL = "#e67e22"   # orange for save confirmations
 
 # ---------------------------------------------------------------------------
-# Style — standard matplotlib
+# Style — standard matplotlib, clean and compact
 # ---------------------------------------------------------------------------
 plt.rcParams.update({
     "figure.facecolor":  "white",
@@ -79,6 +81,8 @@ plt.rcParams.update({
     "lines.antialiased": True,
     "figure.autolayout": False,
 })
+
+home = Path.home()
 
 
 # ===========================================================================
@@ -249,7 +253,7 @@ class OscilloscopeDashboard:
         # Info bar
         self._fig.text(
             0.01, 0.975,
-            f"WaveForms Scope  ·  {self._rate/1e3:.0f} kHz  ·  {self._n} samp  ·  {mode_str}",
+            f"WaveForms Scope  ·  {self._rate/1e3:.0f} kHz  ·  {self._n} samp",
             ha="left", va="top", fontsize=7, color="#888888",
         )
         self._fps_text = self._fig.text(
@@ -276,7 +280,7 @@ class OscilloscopeDashboard:
         lim = self._range / 2 * 1.15
         ax.set_xlim(-lim, lim)
         ax.set_ylim(-lim, lim)
-        ax.set_aspect("equal", adjustable="datalim")
+        ax.set_aspect("equal", adjustable="box")
 
     def _setup_psd_ax(self):
         ax = self._ax_psd
@@ -302,7 +306,7 @@ class OscilloscopeDashboard:
         self._line_ch2, = self._ax_ch2.plot(tw, self._ch2, color=CH2_COL, lw=0.9)
         self._line_xy,  = self._ax_xy.plot(
             self._ch1, self._ch2,
-            color=XY_COL, lw=0, marker=",", markersize=1, alpha=0.5,
+            color=XY_COL, lw=0, marker=".", markersize=2, alpha=1,
         )
         self._line_psd1, = self._ax_psd.plot([], [], color=CH1_COL, lw=1.0, label="CH1")
         self._line_psd2, = self._ax_psd.plot([], [], color=CH2_COL, lw=1.0, label="CH2")
