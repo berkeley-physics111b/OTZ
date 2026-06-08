@@ -24,7 +24,7 @@ Layout
 Requirements
 ------------
   pip install numpy matplotlib pyserial
-  stage_control.py in the same directory
+  stage_serial.py in the same directory
   waveforms_ads.py importable; Digilent WaveForms + Adept Runtime installed
 
 Usage
@@ -51,7 +51,7 @@ import matplotlib.gridspec as gridspec
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 
-import stage_control
+import stage_serial
 
 # ---------------------------------------------------------------------------
 # WaveForms driver
@@ -572,7 +572,7 @@ class OscilloscopeApp:
         lim = self._range / 2 * 1.15
         ax.set_xlim(-lim, lim)
         ax.set_ylim(-lim, lim)
-        ax.set_aspect("equal", adjustable="datalim")
+        ax.set_aspect("equal", adjustable="box")
 
     def _setup_psd_ax(self):
         ax = self._ax_psd
@@ -792,8 +792,8 @@ class OscilloscopeApp:
 
     def _stage_connect_worker(self):
         try:
-            port = stage_control.open_port()
-            stage_control.init_stage(port)
+            port = stage_serial.open_port()
+            stage_serial.init_stage(port)
             self._stage_port = port
         except Exception as exc:
             self._root.after(0, lambda: self._set_stage_status("disconnected"))
@@ -804,7 +804,7 @@ class OscilloscopeApp:
 
     def _stage_on_disconnect(self):
         if self._stage_port is not None:
-            threading.Thread(target=stage_control.close_port,
+            threading.Thread(target=stage_serial.close_port,
                              args=(self._stage_port,), daemon=True).start()
             self._stage_port = None
         self._set_stage_status("disconnected")
@@ -822,44 +822,44 @@ class OscilloscopeApp:
     def _stage_move_left(self):
         if self._stage_ctrl_type == "software" and self._stage_port_ok():
             freq, step = self._stage_get_params()
-            stage_control.move(self._stage_port, axis=1, distance= step, freq=freq)
+            stage_serial.move(self._stage_port, axis=1, distance= step, freq=freq)
 
     def _stage_move_right(self):
         if self._stage_ctrl_type == "software" and self._stage_port_ok():
             freq, step = self._stage_get_params()
-            stage_control.move(self._stage_port, axis=1, distance=-step, freq=freq)
+            stage_serial.move(self._stage_port, axis=1, distance=-step, freq=freq)
 
     def _stage_move_up(self):
         if self._stage_ctrl_type == "software" and self._stage_port_ok():
             freq, step = self._stage_get_params()
-            stage_control.move(self._stage_port, axis=0, distance= step, freq=freq)
+            stage_serial.move(self._stage_port, axis=0, distance= step, freq=freq)
 
     def _stage_move_down(self):
         if self._stage_ctrl_type == "software" and self._stage_port_ok():
             freq, step = self._stage_get_params()
-            stage_control.move(self._stage_port, axis=0, distance=-step, freq=freq)
+            stage_serial.move(self._stage_port, axis=0, distance=-step, freq=freq)
 
     def _stage_on_ctrl_change(self):
         if not self._stage_port_ok():
             return
         if self._ctrl_var.get() == "Software Control":
-            stage_control.joystick_off(self._stage_port)
+            stage_serial.joystick_off(self._stage_port)
             self._stage_ctrl_type = "software"
         else:
-            stage_control.joystick_on(self._stage_port)
+            stage_serial.joystick_on(self._stage_port)
             self._stage_ctrl_type = "joystick"
-            stage_control.set_resolution(
+            stage_serial.set_resolution(
                 self._stage_port, fine=(self._stage_speed == "fine"))
 
     def _stage_on_speed_change(self):
         if self._spd_var.get() == "Fine Control":
             self._stage_speed = "fine"
             if self._stage_port_ok() and self._stage_ctrl_type == "joystick":
-                stage_control.set_resolution(self._stage_port, fine=True)
+                stage_serial.set_resolution(self._stage_port, fine=True)
         else:
             self._stage_speed = "coarse"
             if self._stage_port_ok() and self._stage_ctrl_type == "joystick":
-                stage_control.set_resolution(self._stage_port, fine=False)
+                stage_serial.set_resolution(self._stage_port, fine=False)
 
     # =========================================================================
     # Poll / draw loop
