@@ -356,10 +356,11 @@ class OscilloscopeApp:
         self._fps_t0        = time.time()
 
         # Blit state — populated after figure is built
-        self._bkg_vt:  Optional[object] = None   # saved backgrounds
-        self._bkg_xy:  Optional[object] = None
-        self._bkg_psd: Optional[object] = None
-        self._blit_valid = False   # False → full draw_idle on next frame
+        self._bkg_vt:   Optional[object] = None   # saved backgrounds
+        self._bkg_xy:   Optional[object] = None
+        self._bkg_psd:  Optional[object] = None
+        self._blit_valid   = False   # False → backgrounds need saving
+        self._blit_pending = False   # True → _save_backgrounds already scheduled
 
         # Frozen ylim tracking
         self._last_pk_vt  = 0.0
@@ -628,7 +629,7 @@ class OscilloscopeApp:
         self._canvas.mpl_connect("resize_event", self._on_fig_resize)
 
     def _on_fig_resize(self, _event):
-        self._blit_valid = False
+        self._schedule_background_save()
 
     def _setup_xy_ax(self):
         ax = self._ax_xy
@@ -704,8 +705,21 @@ class OscilloscopeApp:
     # Blit helpers
     # =========================================================================
 
+    def _schedule_background_save(self):
+        """
+        Request a background re-snapshot.  Called whenever axes geometry
+        changes (ylim, resize).  Deferred via after(0) so it runs after Tk
+        finishes compositing the current frame — eliminating the visible flash
+        that a synchronous canvas.draw() would cause mid-redraw.
+        Only one save is ever queued at a time.
+        """
+        if not self._blit_pending:
+            self._blit_pending = True
+            self._root.after(0, self._save_backgrounds)
+
     def _save_backgrounds(self):
         """Full draw then snapshot each axes background for future blits."""
+        self._blit_pending = False
         self._fig.canvas.draw()
         self._bkg_vt  = self._fig.canvas.copy_from_bbox(self._ax_vt.bbox)
         self._bkg_xy  = self._fig.canvas.copy_from_bbox(self._ax_xy.bbox)
@@ -798,7 +812,9 @@ class OscilloscopeApp:
         self._line_psd1.set_data([], [])
         self._line_psd2.set_data([], [])
         self._line_xy.set_data([], [])
-        self._blit_valid = False   # force full redraw + background save
+        self._blit_valid   = False   # will be set True once save completes
+        self._blit_pending = False   # cancel any queued save; Apply does its own
+        self._schedule_background_save()
 
         self._settings_info_var.set(self._settings_info_str())
         self._flash_settings("✓ Applied")
@@ -936,7 +952,7 @@ class OscilloscopeApp:
         self._line_psd1.set_data([], [])
         self._line_psd2.set_data([], [])
         self._stat_vt.set_text("")
-        self._blit_valid = False
+        self._schedule_background_save()
 
     # =========================================================================
     # Stage connect / disconnect
@@ -1062,7 +1078,7 @@ class OscilloscopeApp:
         if abs(pk - self._last_pk_vt) / max(self._last_pk_vt, 1e-9) > _YLIM_THRESHOLD:
             self._ax_vt.set_ylim(-pk * 1.15, pk * 1.15)
             self._last_pk_vt = pk
-            self._blit_valid = False   # ylim change invalidates bkg
+            self._schedule_background_save()
 
         rms1 = float(np.sqrt(np.mean(ch1 ** 2)))
         rms2 = float(np.sqrt(np.mean(ch2 ** 2)))
@@ -1082,7 +1098,7 @@ class OscilloscopeApp:
             self._ax_xy.set_xlim(-lim, lim)
             self._ax_xy.set_ylim(-lim, lim)
             self._last_lim_xy = lim
-            self._blit_valid = False
+            self._schedule_background_save()
 
         # ── 5. Kick off background PSD if due ─────────────────────────────
         self._psd_countdown -= 1
@@ -1110,12 +1126,12 @@ class OscilloscopeApp:
                 if (ylo, yhi) != self._psd_ylim:
                     self._ax_psd.set_ylim(ylo, yhi)
                     self._psd_ylim = (ylo, yhi)
-                    self._blit_valid = False
+                    self._schedule_background_save()
 
-        # ── 7. Blit or full draw ──────────────────────────────────────────
-        if not self._blit_valid:
-            self._save_backgrounds()   # full draw + cache backgrounds
-        else:
+        # ── 7. Blit if backgrounds are ready, otherwise skip this frame ───
+        # Skipping (rather than doing a full draw) means the transition into
+        # and out of a background-save is invisible — no flash.
+        if self._blit_valid:
             self._blit_all()
 
         # ── 8. FPS counter ────────────────────────────────────────────────
