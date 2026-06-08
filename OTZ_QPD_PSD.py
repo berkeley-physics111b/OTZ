@@ -6,18 +6,20 @@ Live dual-channel oscilloscope + PI stage control — dark-theme Tkinter GUI.
 Layout
 ------
   ┌──────────────────────────────────────────────────────────────────┐
-  │  [● ADS status]  [Connect] [Disconnect]  Device idx: [__]       │
-  ├──────────────────────────────────────┬───────────────────────────┤
-  │  Stage Control                       │  CH1 & CH2  V vs t        │
-  │    [● Stage status] [Connect][Disc.] │                           │
-  │    ○ Joystick  ○ Software            │                           │
-  │    ○ Coarse    ○ Fine                │                           │
-  │    Freq: [___]  Step: [___]          │                           │
-  │    [▲]  [◄][►]  [▼]                 │                           │
-  ├──────────────────────────────────────┼───────────────────────────┤
-  │  XY — CH2 vs CH1                    │  PSD  CH1 & CH2           │
-  └──────────────────────────────────────┴───────────────────────────┘
-  [ Export PSD ]  [ Export V(t) ]   FPS: —
+  │  [● ADS status]  [Connect] [Disconnect]  Device idx: [__]  FPS  │
+  ├──────────────────────┬───────────────────────────────────────────┤
+  │  Stage Control       │  Oscilloscope Settings                    │
+  │    [● status]        │    Sample freq (Hz): [______] [Apply]     │
+  │    [Connect][Disc.]  │    History length (s): [______]           │
+  │    ○ Joystick        │                                           │
+  │    ○ Software        ├───────────────────────────────────────────┤
+  │    ○ Coarse / Fine   │  CH1 & CH2 — Voltage vs Time             │
+  │    Freq / Step       │                                           │
+  │    [▲][◄][►][▼]     ├───────────────────────────────────────────┤
+  ├──────────────────────┤  PSD  CH1 & CH2                          │
+  │  XY — CH2 vs CH1    │                                           │
+  └──────────────────────┴───────────────────────────────────────────┘
+  [ Export PSD ]  [ Export V(t) ]
 
 Requirements
 ------------
@@ -28,7 +30,6 @@ Requirements
 Usage
 -----
   python OTZ_QPD_PSD.py
-  python OTZ_QPD_PSD.py --rate 200000 --samples 4096 --range 5.0
 """
 
 import csv
@@ -64,23 +65,22 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Dark-theme palette
 # ---------------------------------------------------------------------------
-BG          = "#1a1a2e"   # window / figure background
-PANEL_BG    = "#16213e"   # axes / widget panel background
-BORDER      = "#0f3460"   # frame borders, grid lines
-FG          = "#e0e0e0"   # primary text
-FG_DIM      = "#8888aa"   # secondary text / tick labels
+BG          = "#1a1a2e"
+PANEL_BG    = "#16213e"
+BORDER      = "#0f3460"
+FG          = "#e0e0e0"
+FG_DIM      = "#8888aa"
 
-CH1_COL     = "#4fc3f7"   # light blue
-CH2_COL     = "#ef5350"   # soft red
-XY_COL      = "#69f0ae"   # mint green
+CH1_COL     = "#4fc3f7"
+CH2_COL     = "#ef5350"
+XY_COL      = "#69f0ae"
 GRID_COL    = "#2a2a4a"
 MINOR_COL   = "#222240"
 
-STATUS_CONNECTED    = "#43d17a"   # green
-STATUS_CONNECTING   = "#90caf9"   # light blue (replaces amber/orange)
-STATUS_DISCONNECTED = "#ef5350"   # red
-
-CONFIRM_COL = "#43d17a"   # green for save confirmations
+STATUS_CONNECTED    = "#43d17a"
+STATUS_CONNECTING   = "#90caf9"
+STATUS_DISCONNECTED = "#ef5350"
+CONFIRM_COL         = "#43d17a"
 
 # ---------------------------------------------------------------------------
 # Matplotlib dark style
@@ -111,7 +111,7 @@ plt.rcParams.update({
 })
 
 # ---------------------------------------------------------------------------
-# Tk dark style (ttk)
+# Tk dark style
 # ---------------------------------------------------------------------------
 _STYLE_INITED = False
 
@@ -120,50 +120,31 @@ def _init_ttk_style(root: tk.Tk) -> None:
     if _STYLE_INITED:
         return
     _STYLE_INITED = True
-
     root.configure(bg=BG)
     s = ttk.Style(root)
     s.theme_use("clam")
-
-    common = {"background": BG, "foreground": FG,
-              "fieldbackground": PANEL_BG, "bordercolor": BORDER,
-              "darkcolor": PANEL_BG, "lightcolor": BORDER,
-              "troughcolor": PANEL_BG, "selectbackground": BORDER,
-              "selectforeground": FG}
-
     for widget in ("TFrame", "TLabel", "TLabelframe", "TLabelframe.Label",
                    "TCheckbutton", "TRadiobutton"):
-        s.configure(widget, **{k: v for k, v in common.items()
-                                if k in ("background", "foreground")})
-
+        s.configure(widget, background=BG, foreground=FG)
     s.configure("TButton",
                 background=BORDER, foreground=FG,
                 bordercolor=BORDER, relief="flat", padding=4)
     s.map("TButton",
           background=[("active", "#1a4080"), ("disabled", PANEL_BG)],
           foreground=[("disabled", FG_DIM)])
-
     s.configure("TEntry",
                 fieldbackground=PANEL_BG, foreground=FG,
                 insertcolor=FG, bordercolor=BORDER)
-
     s.configure("TSpinbox",
                 fieldbackground=PANEL_BG, foreground=FG,
-                insertcolor=FG, bordercolor=BORDER,
-                arrowcolor=FG)
-
+                insertcolor=FG, bordercolor=BORDER, arrowcolor=FG)
     s.configure("TSeparator", background=BORDER)
-
-    s.configure("TRadiobutton",
-                background=BG, foreground=FG,
+    s.configure("TRadiobutton", background=BG, foreground=FG,
                 indicatorcolor=BORDER, focuscolor=BG)
     s.map("TRadiobutton",
           indicatorcolor=[("selected", STATUS_CONNECTED)])
-
-    s.configure("TLabelframe",
-                background=BG, bordercolor=BORDER)
-    s.configure("TLabelframe.Label",
-                background=BG, foreground=FG_DIM)
+    s.configure("TLabelframe", background=BG, bordercolor=BORDER)
+    s.configure("TLabelframe.Label", background=BG, foreground=FG_DIM)
 
 
 # ===========================================================================
@@ -173,7 +154,8 @@ def _init_ttk_style(root: tk.Tk) -> None:
 def compute_psd(signal: np.ndarray, sample_rate: float) -> Tuple[np.ndarray, np.ndarray]:
     try:
         from scipy.signal import welch
-        return welch(signal, fs=sample_rate, nperseg=min(len(signal), 512), scaling="density")
+        nperseg = min(len(signal), 4096)
+        return welch(signal, fs=sample_rate, nperseg=nperseg, scaling="density")
     except ImportError:
         n = len(signal)
         w = np.hanning(n)
@@ -189,14 +171,19 @@ def compute_psd(signal: np.ndarray, sample_rate: float) -> Tuple[np.ndarray, np.
 # ===========================================================================
 
 class AcquisitionThread(threading.Thread):
-    def __init__(self, device, sample_rate: float, n_samples: int,
+    """
+    Continuously acquires fixed-size chunks from the ADS and pushes them to
+    a queue.  The chunk size (_n) is chosen to be ~50 ms worth of samples so
+    the queue stays responsive regardless of history length.
+    """
+    def __init__(self, device, sample_rate: float, chunk_size: int,
                  out_queue: queue.Queue):
         super().__init__(daemon=True)
-        self._dev  = device
-        self._rate = sample_rate
-        self._n    = n_samples
-        self._q    = out_queue
-        self._stop = threading.Event()
+        self._dev   = device
+        self._rate  = sample_rate
+        self._n     = chunk_size
+        self._q     = out_queue
+        self._stop  = threading.Event()
 
     def stop(self):
         self._stop.set()
@@ -240,39 +227,50 @@ class AcquisitionThread(threading.Thread):
 # Main Application
 # ===========================================================================
 
+# Defaults
+_DEFAULT_SAMPLE_RATE_HZ = 8_000
+_DEFAULT_HISTORY_S      = 8.0
+_DEFAULT_INPUT_RANGE_V  = 5.0
+_DEFAULT_DEVICE_INDEX   = -1
+# Acquisition chunk: aim for ~50 ms per chunk (minimum 64 samples)
+_CHUNK_MS = 50
+
 class OscilloscopeApp:
 
-    _POLL_MS      = 50    # ms between Tk .after() polls
-    _MIN_DRAW_SEC = 0.08  # ~12 fps cap
+    _POLL_MS      = 50
+    _MIN_DRAW_SEC = 0.08
 
-    def __init__(self, root: tk.Tk, sample_rate=100_000, n_samples=4096,
-                 input_range=5.0, device_index=-1):
-        self._root      = root
-        self._rate      = float(sample_rate)
-        self._n         = int(n_samples)
-        self._range     = float(input_range)
-        self._dev_index = device_index
+    def __init__(self, root: tk.Tk):
+        self._root = root
+
+        # Live acquisition settings (updated on Apply)
+        self._rate      = float(_DEFAULT_SAMPLE_RATE_HZ)
+        self._history_s = float(_DEFAULT_HISTORY_S)
+        self._range     = float(_DEFAULT_INPUT_RANGE_V)
 
         # ADS state
         self._device: Optional[object] = None
         self._acq:    Optional[AcquisitionThread] = None
-        self._q       = queue.Queue(maxsize=2)
+        self._q       = queue.Queue(maxsize=4)
 
         # Stage state
         self._stage_port:     Optional[object] = None
-        self._stage_ctrl_type = "joystick"   # "joystick" | "software"
-        self._stage_speed     = "coarse"     # "coarse"   | "fine"
+        self._stage_ctrl_type = "joystick"
+        self._stage_speed     = "coarse"
 
-        # Waveform buffers
-        self._ch1     = np.zeros(self._n)
-        self._ch2     = np.zeros(self._n)
-        self._freqs1  = np.array([1.0, 2.0])
-        self._psd1    = np.array([1e-9, 1e-9])
-        self._freqs2  = np.array([1.0, 2.0])
-        self._psd2    = np.array([1e-9, 1e-9])
-        self._time_ms = np.linspace(0, self._n / self._rate * 1e3, self._n)
+        # Rolling history buffers — sized to history_s * rate
+        self._history_n = self._calc_history_n()
+        self._hist_ch1  = np.zeros(self._history_n)
+        self._hist_ch2  = np.zeros(self._history_n)
+        self._time_s    = np.linspace(0.0, self._history_s, self._history_n)
 
-        # FPS tracking
+        # PSD buffers (last computed)
+        self._freqs1 = np.array([1.0, 2.0])
+        self._psd1   = np.array([1e-9, 1e-9])
+        self._freqs2 = np.array([1.0, 2.0])
+        self._psd2   = np.array([1e-9, 1e-9])
+
+        # Draw bookkeeping
         self._last_draw   = 0.0
         self._frame_count = 0
         self._psd_skip    = 0
@@ -288,6 +286,19 @@ class OscilloscopeApp:
         self._set_stage_status("disconnected")
         self._root.after(self._POLL_MS, self._poll)
 
+    # -------------------------------------------------------------------------
+    # Helpers
+    # -------------------------------------------------------------------------
+
+    def _calc_history_n(self) -> int:
+        """Total samples in the rolling display buffer."""
+        return max(64, int(round(self._rate * self._history_s)))
+
+    def _calc_chunk_n(self) -> int:
+        """Acquisition chunk size: ~_CHUNK_MS ms, rounded to power-of-2 minimum."""
+        n = int(round(self._rate * _CHUNK_MS / 1000))
+        return max(64, n)
+
     # =========================================================================
     # UI construction
     # =========================================================================
@@ -295,7 +306,7 @@ class OscilloscopeApp:
     def _build_ui(self):
         root = self._root
 
-        # ── ADS control bar ───────────────────────────────────────────────
+        # ── ADS top bar ───────────────────────────────────────────────────
         ads_bar = ttk.Frame(root, padding=(6, 4))
         ads_bar.pack(side=tk.TOP, fill=tk.X)
 
@@ -309,16 +320,16 @@ class OscilloscopeApp:
             ads_bar, text="ADS: Disconnected",
             fg=STATUS_DISCONNECTED, bg=BG,
             font=("TkDefaultFont", 9, "bold"))
-        self._ads_status_lbl.pack(side=tk.LEFT, padx=(0, 16))
+        self._ads_status_lbl.pack(side=tk.LEFT, padx=(0, 12))
 
         self._ads_device_lbl = tk.Label(
             ads_bar, text="Device: —", fg=FG_DIM, bg=BG)
-        self._ads_device_lbl.pack(side=tk.LEFT, padx=(0, 20))
+        self._ads_device_lbl.pack(side=tk.LEFT, padx=(0, 18))
 
         tk.Label(ads_bar, text="Device index:", fg=FG, bg=BG).pack(side=tk.LEFT)
-        self._ads_idx_var = tk.IntVar(value=self._dev_index)
+        self._ads_idx_var = tk.IntVar(value=_DEFAULT_DEVICE_INDEX)
         ttk.Spinbox(ads_bar, from_=-1, to=15, width=4,
-                    textvariable=self._ads_idx_var).pack(side=tk.LEFT, padx=(2, 10))
+                    textvariable=self._ads_idx_var).pack(side=tk.LEFT, padx=(2, 8))
 
         self._ads_btn_connect = ttk.Button(
             ads_bar, text="Connect", command=self._ads_on_connect)
@@ -335,15 +346,12 @@ class OscilloscopeApp:
 
         ttk.Separator(root, orient=tk.HORIZONTAL).pack(fill=tk.X)
 
-        # ── Main content area (left panel + right plots) ──────────────────
+        # ── Main content: left panel + right column ───────────────────────
         content = ttk.Frame(root)
         content.pack(fill=tk.BOTH, expand=True)
 
-        # LEFT: stage control panel (fixed width)
-        self._build_stage_panel(content)
-
-        # RIGHT: matplotlib canvas (expands to fill)
-        self._build_plots(content)
+        self._build_left_panel(content)
+        self._build_right_column(content)
 
         ttk.Separator(root, orient=tk.HORIZONTAL).pack(fill=tk.X)
 
@@ -360,16 +368,45 @@ class OscilloscopeApp:
         tk.Label(export_bar, textvariable=self._export_msg_var,
                  fg=CONFIRM_COL, bg=BG).pack(side=tk.LEFT, padx=8)
 
-    # ── Stage control panel ───────────────────────────────────────────────
+    # ── Left panel: stage control + XY plot ──────────────────────────────
+
+    def _build_left_panel(self, parent):
+        """
+        Left column: stage control widget on top, XY matplotlib axes below.
+        The XY axes is embedded in its own small Figure so it can sit naturally
+        alongside the Tk widgets without fighting the right-column GridSpec.
+        """
+        left = tk.Frame(parent, bg=BG, width=230)
+        left.pack(side=tk.LEFT, fill=tk.Y, padx=(6, 0), pady=6)
+        left.pack_propagate(False)
+
+        self._build_stage_panel(left)
+
+        # Thin separator between stage controls and XY plot
+        ttk.Separator(left, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=6)
+
+        # XY figure embedded in left column
+        self._fig_xy = Figure(figsize=(2.3, 2.3), dpi=100)
+        self._ax_xy  = self._fig_xy.add_subplot(111)
+        self._fig_xy.subplots_adjust(left=0.18, right=0.97, top=0.90, bottom=0.16)
+        self._setup_xy_ax()
+
+        canvas_xy = FigureCanvasTkAgg(self._fig_xy, master=left)
+        canvas_xy.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        self._canvas_xy = canvas_xy
+
+        # XY artist
+        self._line_xy, = self._ax_xy.plot(
+            [], [],
+            color=XY_COL, lw=0,
+            marker="o", markersize=2.5, markeredgewidth=0,
+            alpha=0.75,
+        )
 
     def _build_stage_panel(self, parent):
-        panel = tk.Frame(parent, bg=BG, width=210)
-        panel.pack(side=tk.LEFT, fill=tk.Y, padx=(6, 0), pady=6)
-        panel.pack_propagate(False)
-
         # Stage status row
-        status_row = tk.Frame(panel, bg=BG)
-        status_row.pack(fill=tk.X, pady=(0, 6))
+        status_row = tk.Frame(parent, bg=BG)
+        status_row.pack(fill=tk.X, pady=(0, 4))
 
         self._stage_status_canvas = tk.Canvas(
             status_row, width=14, height=14, highlightthickness=0, bg=BG)
@@ -383,9 +420,8 @@ class OscilloscopeApp:
             font=("TkDefaultFont", 9, "bold"))
         self._stage_status_lbl.pack(side=tk.LEFT)
 
-        # Stage connect / disconnect buttons
-        btn_row = tk.Frame(panel, bg=BG)
-        btn_row.pack(fill=tk.X, pady=(0, 8))
+        btn_row = tk.Frame(parent, bg=BG)
+        btn_row.pack(fill=tk.X, pady=(0, 6))
 
         self._stage_btn_connect = ttk.Button(
             btn_row, text="Connect", command=self._stage_on_connect)
@@ -396,44 +432,37 @@ class OscilloscopeApp:
             state=tk.DISABLED)
         self._stage_btn_disconnect.pack(side=tk.LEFT)
 
-        # Control type
-        ctrl_frame = ttk.LabelFrame(panel, text="Control Type")
-        ctrl_frame.pack(fill=tk.X, pady=4)
+        ctrl_frame = ttk.LabelFrame(parent, text="Control Type")
+        ctrl_frame.pack(fill=tk.X, pady=2)
         self._ctrl_var = tk.StringVar(value="Joystick Control")
         for opt in ("Joystick Control", "Software Control"):
             ttk.Radiobutton(ctrl_frame, text=opt, variable=self._ctrl_var,
                             value=opt,
                             command=self._stage_on_ctrl_change).pack(anchor="w")
 
-        # Joystick speed
-        spd_frame = ttk.LabelFrame(panel, text="Joystick Speed")
-        spd_frame.pack(fill=tk.X, pady=4)
+        spd_frame = ttk.LabelFrame(parent, text="Joystick Speed")
+        spd_frame.pack(fill=tk.X, pady=2)
         self._spd_var = tk.StringVar(value="Coarse Control")
         for opt in ("Coarse Control", "Fine Control"):
             ttk.Radiobutton(spd_frame, text=opt, variable=self._spd_var,
                             value=opt,
                             command=self._stage_on_speed_change).pack(anchor="w")
 
-        # Parameters
-        param_frame = ttk.LabelFrame(panel, text="Parameters")
-        param_frame.pack(fill=tk.X, pady=4)
-
+        param_frame = ttk.LabelFrame(parent, text="Parameters")
+        param_frame.pack(fill=tk.X, pady=2)
         tk.Label(param_frame, text="Frequency:", fg=FG, bg=BG).grid(
-            row=0, column=0, sticky="w", padx=4, pady=2)
+            row=0, column=0, sticky="w", padx=4, pady=1)
         self._freq_var = tk.StringVar(value="250")
         ttk.Entry(param_frame, textvariable=self._freq_var,
-                  width=10).grid(row=0, column=1, padx=4, pady=2)
-
+                  width=9).grid(row=0, column=1, padx=4, pady=1)
         tk.Label(param_frame, text="Step size:", fg=FG, bg=BG).grid(
-            row=1, column=0, sticky="w", padx=4, pady=2)
+            row=1, column=0, sticky="w", padx=4, pady=1)
         self._step_var = tk.StringVar(value="100")
         ttk.Entry(param_frame, textvariable=self._step_var,
-                  width=10).grid(row=1, column=1, padx=4, pady=2)
+                  width=9).grid(row=1, column=1, padx=4, pady=1)
 
-        # Directional buttons
-        move_frame = ttk.LabelFrame(panel, text="Move")
-        move_frame.pack(fill=tk.X, pady=4)
-
+        move_frame = ttk.LabelFrame(parent, text="Move")
+        move_frame.pack(fill=tk.X, pady=2)
         btn_kw = {"width": 7}
         ttk.Button(move_frame, text="▲ Up",
                    command=self._stage_move_up,    **btn_kw).grid(row=0, column=1, pady=2)
@@ -443,48 +472,94 @@ class OscilloscopeApp:
                    command=self._stage_move_right, **btn_kw).grid(row=1, column=2, padx=2)
         ttk.Button(move_frame, text="▼ Down",
                    command=self._stage_move_down,  **btn_kw).grid(row=2, column=1, pady=2)
-
         for col in (0, 1, 2):
             move_frame.columnconfigure(col, weight=1)
 
-    # ── Matplotlib panels ─────────────────────────────────────────────────
+    # ── Right column: settings panel + V(t) + PSD ────────────────────────
+
+    def _build_right_column(self, parent):
+        right = ttk.Frame(parent)
+        right.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=6, pady=6)
+
+        self._build_settings_panel(right)
+
+        ttk.Separator(right, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=(4, 0))
+
+        self._build_plots(right)
+
+    def _build_settings_panel(self, parent):
+        settings = ttk.LabelFrame(parent, text="Oscilloscope Settings")
+        settings.pack(fill=tk.X, pady=(0, 2))
+
+        inner = ttk.Frame(settings, padding=(6, 4))
+        inner.pack(fill=tk.X)
+
+        # Sample frequency
+        ttk.Label(inner, text="Sample frequency (Hz):").grid(
+            row=0, column=0, sticky="w", padx=(0, 6), pady=3)
+        self._setting_rate_var = tk.StringVar(
+            value=str(int(_DEFAULT_SAMPLE_RATE_HZ)))
+        ttk.Entry(inner, textvariable=self._setting_rate_var,
+                  width=10).grid(row=0, column=1, sticky="w", pady=3)
+
+        # History length
+        ttk.Label(inner, text="History length (s):").grid(
+            row=1, column=0, sticky="w", padx=(0, 6), pady=3)
+        self._setting_history_var = tk.StringVar(
+            value=str(_DEFAULT_HISTORY_S))
+        ttk.Entry(inner, textvariable=self._setting_history_var,
+                  width=10).grid(row=1, column=1, sticky="w", pady=3)
+
+        # Apply button + feedback label on same row as the button
+        btn_row = ttk.Frame(inner)
+        btn_row.grid(row=0, column=2, rowspan=2, padx=(14, 0), sticky="ns")
+
+        ttk.Button(btn_row, text="Apply",
+                   command=self._settings_apply).pack(anchor="center", expand=True)
+
+        self._settings_msg_var = tk.StringVar(value="")
+        tk.Label(inner, textvariable=self._settings_msg_var,
+                 fg=CONFIRM_COL, bg=BG, font=("TkDefaultFont", 8)).grid(
+            row=0, column=3, rowspan=2, padx=(10, 0), sticky="w")
+
+        # Read-only info label showing active settings
+        self._settings_info_var = tk.StringVar(value=self._settings_info_str())
+        tk.Label(inner, textvariable=self._settings_info_var,
+                 fg=FG_DIM, bg=BG, font=("TkDefaultFont", 7)).grid(
+            row=2, column=0, columnspan=4, sticky="w", pady=(2, 0))
+
+    def _settings_info_str(self) -> str:
+        history_n = self._calc_history_n()
+        nyquist   = self._rate / 2
+        return (f"Active:  {self._rate:,.0f} Hz  ·  {self._history_s:.1f} s  "
+                f"·  {history_n:,} samples  ·  Nyquist {nyquist:,.0f} Hz")
+
+    # ── Matplotlib plots (V(t) + PSD) ─────────────────────────────────────
 
     def _build_plots(self, parent):
-        self._fig = Figure(figsize=(11, 7), dpi=100)
-
-        # 2×2 grid: top-right = combined V(t), bottom-left = XY, bottom-right = PSD
-        # top-left cell is occupied by the Tk stage panel, so we only add 3 axes
+        self._fig = Figure(figsize=(9, 5.5), dpi=100)
         gs = gridspec.GridSpec(
-            2, 2, figure=self._fig,
-            hspace=0.38, wspace=0.30,
-            left=0.07, right=0.97,
-            top=0.93, bottom=0.07,
+            2, 1, figure=self._fig,
+            hspace=0.42,
+            left=0.08, right=0.97,
+            top=0.94, bottom=0.09,
         )
-        self._ax_vt  = self._fig.add_subplot(gs[0, 1])   # top-right: CH1+CH2 V(t)
-        self._ax_xy  = self._fig.add_subplot(gs[1, 0])   # bottom-left: XY
-        self._ax_psd = self._fig.add_subplot(gs[1, 1])   # bottom-right: PSD
+        self._ax_vt  = self._fig.add_subplot(gs[0])
+        self._ax_psd = self._fig.add_subplot(gs[1])
 
         self._setup_vt_ax()
-        self._setup_xy_ax()
         self._setup_psd_ax()
-        self._create_artists()
-
-        self._fig.text(
-            0.5, 0.975,
-            f"{self._rate/1e3:.0f} kHz  ·  {self._n} samples",
-            ha="center", va="top", fontsize=7, color=FG_DIM,
-        )
+        self._create_plot_artists()
 
         self._canvas = FigureCanvasTkAgg(self._fig, master=parent)
-        self._canvas.get_tk_widget().pack(
-            side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self._canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
 
     def _setup_vt_ax(self):
         ax = self._ax_vt
         ax.set_title("CH1 & CH2 — Voltage vs Time", pad=3)
-        ax.set_xlabel("Time (ms)", labelpad=1)
+        ax.set_xlabel("Time (s)", labelpad=1)
         ax.set_ylabel("Voltage (V)", labelpad=1)
-        ax.set_xlim(self._time_ms[0], self._time_ms[-1])
+        ax.set_xlim(0.0, self._history_s)
         ax.set_ylim(-self._range / 2 * 1.15, self._range / 2 * 1.15)
         ax.minorticks_on()
         ax.grid(True, which="minor", linewidth=0.25, color=MINOR_COL)
@@ -514,17 +589,15 @@ class OscilloscopeApp:
         ax.tick_params(axis="both", which="minor", labelbottom=False, labelleft=False)
         ax.grid(True, which="minor", linewidth=0.25, color=MINOR_COL)
 
-    def _create_artists(self):
-        tw = self._time_ms
+    def _create_plot_artists(self):
+        tw = self._time_s
 
-        # Combined V(t) — both channels on one axis
-        self._line_ch1, = self._ax_vt.plot(tw, self._ch1, color=CH1_COL,
-                                            lw=0.9, label="CH1")
-        self._line_ch2, = self._ax_vt.plot(tw, self._ch2, color=CH2_COL,
-                                            lw=0.9, label="CH2")
+        self._line_ch1, = self._ax_vt.plot(
+            tw, self._hist_ch1, color=CH1_COL, lw=0.9, label="CH1")
+        self._line_ch2, = self._ax_vt.plot(
+            tw, self._hist_ch2, color=CH2_COL, lw=0.9, label="CH2")
         self._ax_vt.legend(fontsize=7, loc="upper right", framealpha=0.7)
 
-        # Stats box (two-line text in top-right corner of V(t) panel)
         self._stat_vt = self._ax_vt.text(
             0.01, 0.98, "",
             fontsize=6.5, va="top", ha="left",
@@ -534,18 +607,90 @@ class OscilloscopeApp:
                       edgecolor=BORDER, alpha=0.9),
         )
 
-        # XY — larger, solid scatter-style points for visibility
-        self._line_xy, = self._ax_xy.plot(
-            self._ch1, self._ch2,
-            color=XY_COL, lw=0,
-            marker="o", markersize=2.5, markeredgewidth=0,
-            alpha=0.75,
-        )
-
-        # PSD
-        self._line_psd1, = self._ax_psd.plot([], [], color=CH1_COL, lw=1.1, label="CH1")
-        self._line_psd2, = self._ax_psd.plot([], [], color=CH2_COL, lw=1.1, label="CH2")
+        self._line_psd1, = self._ax_psd.plot(
+            [], [], color=CH1_COL, lw=1.1, label="CH1")
+        self._line_psd2, = self._ax_psd.plot(
+            [], [], color=CH2_COL, lw=1.1, label="CH2")
         self._ax_psd.legend(fontsize=7, loc="upper right", framealpha=0.7)
+
+    # =========================================================================
+    # Settings — Apply
+    # =========================================================================
+
+    def _settings_apply(self):
+        # Parse and validate
+        try:
+            new_rate = float(self._setting_rate_var.get())
+            if new_rate <= 0:
+                raise ValueError("must be > 0")
+        except ValueError:
+            messagebox.showerror("Invalid Setting",
+                                 "Sample frequency must be a positive number.")
+            return
+
+        try:
+            new_history = float(self._setting_history_var.get())
+            if new_history <= 0:
+                raise ValueError("must be > 0")
+        except ValueError:
+            messagebox.showerror("Invalid Setting",
+                                 "History length must be a positive number.")
+            return
+
+        rate_changed    = (new_rate    != self._rate)
+        history_changed = (new_history != self._history_s)
+
+        if not rate_changed and not history_changed:
+            self._flash_settings("Already applied.")
+            return
+
+        self._rate      = new_rate
+        self._history_s = new_history
+
+        # Rebuild history buffers
+        self._history_n = self._calc_history_n()
+        self._hist_ch1  = np.zeros(self._history_n)
+        self._hist_ch2  = np.zeros(self._history_n)
+        self._time_s    = np.linspace(0.0, self._history_s, self._history_n)
+
+        # Reset PSD buffers so stale data is not displayed
+        self._freqs1 = np.array([1.0, 2.0])
+        self._psd1   = np.array([1e-9, 1e-9])
+        self._freqs2 = np.array([1.0, 2.0])
+        self._psd2   = np.array([1e-9, 1e-9])
+
+        # If the sample rate changed and ADS is running, restart acquisition
+        if rate_changed and self._device is not None:
+            self._stop_acquisition()
+            chunk_n = self._calc_chunk_n()
+            self._acq = AcquisitionThread(
+                self._device, self._rate, chunk_n, self._q)
+            self._acq.start()
+
+        # Update plot axes and artists to match new settings
+        self._ax_vt.set_xlim(0.0, self._history_s)
+        self._ax_psd.set_xlim(1.0, self._rate / 2)
+
+        # Rebuild V(t) line x-data (length changed)
+        self._line_ch1.set_xdata(self._time_s)
+        self._line_ch1.set_ydata(self._hist_ch1)
+        self._line_ch2.set_xdata(self._time_s)
+        self._line_ch2.set_ydata(self._hist_ch2)
+
+        # Clear PSD lines
+        self._line_psd1.set_data([], [])
+        self._line_psd2.set_data([], [])
+
+        self._canvas.draw_idle()
+        self._canvas_xy.draw_idle()
+
+        self._settings_info_var.set(self._settings_info_str())
+        self._flash_settings("✓ Applied")
+
+    def _flash_settings(self, msg: str, duration: float = 2.5):
+        self._settings_msg_var.set(msg)
+        self._root.after(int(duration * 1000),
+                         lambda: self._settings_msg_var.set(""))
 
     # =========================================================================
     # Status helpers
@@ -561,7 +706,6 @@ class OscilloscopeApp:
         self._ads_status_canvas.itemconfig(self._ads_dot, fill=col)
         self._ads_status_lbl.config(text=text, fg=col)
         self._ads_device_lbl.config(text=f"Device: {device_name}")
-
         connected = (state == "connected")
         self._ads_btn_connect.config(
             state=tk.DISABLED if connected else tk.NORMAL)
@@ -577,7 +721,6 @@ class OscilloscopeApp:
         col, text = colours.get(state, colours["disconnected"])
         self._stage_status_canvas.itemconfig(self._stage_dot, fill=col)
         self._stage_status_lbl.config(text=text, fg=col)
-
         connected = (state == "connected")
         self._stage_btn_connect.config(
             state=tk.DISABLED if connected else tk.NORMAL)
@@ -613,7 +756,8 @@ class OscilloscopeApp:
                 "ADS Connection Failed", str(exc)))
             return
 
-        self._acq = AcquisitionThread(self._device, self._rate, self._n, self._q)
+        chunk_n = self._calc_chunk_n()
+        self._acq = AcquisitionThread(self._device, self._rate, chunk_n, self._q)
         self._acq.start()
         self._root.after(0, lambda: self._set_ads_status("connected", name))
 
@@ -644,8 +788,7 @@ class OscilloscopeApp:
 
     def _stage_on_connect(self):
         self._set_stage_status("connecting")
-        threading.Thread(target=self._stage_connect_worker,
-                         daemon=True).start()
+        threading.Thread(target=self._stage_connect_worker, daemon=True).start()
 
     def _stage_connect_worker(self):
         try:
@@ -661,17 +804,13 @@ class OscilloscopeApp:
 
     def _stage_on_disconnect(self):
         if self._stage_port is not None:
-            threading.Thread(
-                target=stage_control.close_port,
-                args=(self._stage_port,),
-                daemon=True,
-            ).start()
+            threading.Thread(target=stage_control.close_port,
+                             args=(self._stage_port,), daemon=True).start()
             self._stage_port = None
         self._set_stage_status("disconnected")
 
     def _stage_port_ok(self) -> bool:
-        return (self._stage_port is not None and
-                self._stage_port.is_open)
+        return self._stage_port is not None and self._stage_port.is_open
 
     # =========================================================================
     # Stage motion / mode callbacks
@@ -683,22 +822,22 @@ class OscilloscopeApp:
     def _stage_move_left(self):
         if self._stage_ctrl_type == "software" and self._stage_port_ok():
             freq, step = self._stage_get_params()
-            stage_control.move(self._stage_port, axis=1,  distance= step, freq=freq)
+            stage_control.move(self._stage_port, axis=1, distance= step, freq=freq)
 
     def _stage_move_right(self):
         if self._stage_ctrl_type == "software" and self._stage_port_ok():
             freq, step = self._stage_get_params()
-            stage_control.move(self._stage_port, axis=1,  distance=-step, freq=freq)
+            stage_control.move(self._stage_port, axis=1, distance=-step, freq=freq)
 
     def _stage_move_up(self):
         if self._stage_ctrl_type == "software" and self._stage_port_ok():
             freq, step = self._stage_get_params()
-            stage_control.move(self._stage_port, axis=0,  distance= step, freq=freq)
+            stage_control.move(self._stage_port, axis=0, distance= step, freq=freq)
 
     def _stage_move_down(self):
         if self._stage_ctrl_type == "software" and self._stage_port_ok():
             freq, step = self._stage_get_params()
-            stage_control.move(self._stage_port, axis=0,  distance=-step, freq=freq)
+            stage_control.move(self._stage_port, axis=0, distance=-step, freq=freq)
 
     def _stage_on_ctrl_change(self):
         if not self._stage_port_ok():
@@ -729,22 +868,33 @@ class OscilloscopeApp:
     def _poll(self):
         now = time.time()
         if now - self._last_draw >= self._MIN_DRAW_SEC:
-            ch1 = ch2 = None
+            # Drain all queued chunks, appending each to the rolling buffers
+            got_data = False
             try:
                 while True:
-                    ch1, ch2 = self._q.get_nowait()
+                    ch1_chunk, ch2_chunk = self._q.get_nowait()
+                    n = len(ch1_chunk)
+                    self._hist_ch1 = np.roll(self._hist_ch1, -n)
+                    self._hist_ch2 = np.roll(self._hist_ch2, -n)
+                    self._hist_ch1[-n:] = ch1_chunk
+                    self._hist_ch2[-n:] = ch2_chunk
+                    got_data = True
             except queue.Empty:
                 pass
-            if ch1 is not None:
-                self._redraw(ch1, ch2, now)
+
+            if got_data:
+                self._redraw(now)
+
         self._root.after(self._POLL_MS, self._poll)
 
-    def _redraw(self, ch1, ch2, now):
-        self._ch1, self._ch2 = ch1, ch2
+    def _redraw(self, now):
         self._last_draw = now
         self._frame_count += 1
 
-        # V(t) — update both lines on the shared axis
+        ch1 = self._hist_ch1
+        ch2 = self._hist_ch2
+
+        # V(t)
         self._line_ch1.set_ydata(ch1)
         self._line_ch2.set_ydata(ch2)
 
@@ -761,14 +911,14 @@ class OscilloscopeApp:
             f"rms {rms2:.3f}  μ {ch2.mean():+.4f}"
         )
 
-        # XY
+        # XY (separate canvas)
         self._line_xy.set_xdata(ch1)
         self._line_xy.set_ydata(ch2)
         lim = max(abs(ch1).max(), abs(ch2).max(), 1e-9) * 1.15
         self._ax_xy.set_xlim(-lim, lim)
         self._ax_xy.set_ylim(-lim, lim)
 
-        # PSD — every other frame
+        # PSD — every other draw frame
         self._psd_skip += 1
         if self._psd_skip >= 2:
             self._psd_skip = 0
@@ -791,6 +941,7 @@ class OscilloscopeApp:
             self._fps_var.set(f"FPS: {self._fps:.1f}")
 
         self._canvas.draw_idle()
+        self._canvas_xy.draw_idle()
 
     # =========================================================================
     # Export
@@ -804,7 +955,9 @@ class OscilloscopeApp:
     def _meta_rows(self, stamp):
         return [
             [f"# OTZ QPD Export  {stamp}"],
-            [f"# Sample rate: {self._rate:.0f} Hz", f"N: {self._n}"],
+            [f"# Sample rate: {self._rate:.0f} Hz",
+             f"History: {self._history_s:.1f} s",
+             f"N: {self._history_n}"],
         ]
 
     def _write_csv(self, fname, header_rows, col_names, rows):
@@ -840,8 +993,8 @@ class OscilloscopeApp:
         try:
             self._write_csv(
                 fname, self._meta_rows(stamp),
-                ["time_ms", "ch1_v", "ch2_v"],
-                zip(self._time_ms, self._ch1, self._ch2),
+                ["time_s", "ch1_v", "ch2_v"],
+                zip(self._time_s, self._hist_ch1, self._hist_ch2),
             )
             self._flash_export(f"✓ Saved {fname}")
         except OSError as exc:
