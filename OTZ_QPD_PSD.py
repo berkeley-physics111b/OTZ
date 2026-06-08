@@ -38,7 +38,7 @@ from typing import Optional, Tuple
 
 import numpy as np
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk, messagebox, filedialog
 import matplotlib
 matplotlib.use("TkAgg")
 import matplotlib.pyplot as plt
@@ -506,9 +506,25 @@ class OscilloscopeApp:
         ttk.Entry(inner, textvariable=self._setting_history_var,
                   width=10).grid(row=1, column=1, sticky="w", pady=3)
 
-        ttk.Button(inner, text="Apply",
-                   command=self._settings_apply).grid(
-            row=0, column=2, rowspan=2, padx=(14, 0), sticky="ns")
+        # Button cluster: Apply | Start | Stop | Clear Graphs
+        btn_frame = ttk.Frame(inner)
+        btn_frame.grid(row=0, column=2, rowspan=2, padx=(14, 0), sticky="ns")
+
+        ttk.Button(btn_frame, text="Apply",
+                   command=self._settings_apply).pack(side=tk.LEFT, padx=(0, 2))
+
+        self._acq_btn_start = ttk.Button(btn_frame, text="Start",
+                                         command=self._acq_start,
+                                         state=tk.DISABLED)
+        self._acq_btn_start.pack(side=tk.LEFT, padx=2)
+
+        self._acq_btn_stop = ttk.Button(btn_frame, text="Stop",
+                                        command=self._acq_stop,
+                                        state=tk.DISABLED)
+        self._acq_btn_stop.pack(side=tk.LEFT, padx=2)
+
+        ttk.Button(btn_frame, text="Clear Graphs",
+                   command=self._clear_graphs).pack(side=tk.LEFT, padx=(2, 0))
 
         self._settings_msg_var = tk.StringVar(value="")
         tk.Label(inner, textvariable=self._settings_msg_var,
@@ -670,9 +686,12 @@ class OscilloscopeApp:
 
         # Restart acquisition if rate changed and device is live
         if rate_changed and self._device is not None:
+            was_acquiring = self._acq is not None
             self._stop_acquisition(close_device=False)
-            self._acq = AcquisitionThread(self._device, self._rate, self._q)
-            self._acq.start()
+            if was_acquiring:
+                self._acq = AcquisitionThread(self._device, self._rate, self._q)
+                self._acq.start()
+                self._set_acquiring()
 
         # Update plot axes
         self._ax_vt.set_xlim(0.0, self._history_s)
@@ -716,6 +735,10 @@ class OscilloscopeApp:
             state=tk.DISABLED if connected else tk.NORMAL)
         self._ads_btn_disconnect.config(
             state=tk.NORMAL if connected else tk.DISABLED)
+        # Start enabled when connected but not acquiring; Stop when acquiring
+        self._acq_btn_start.config(
+            state=tk.NORMAL if connected else tk.DISABLED)
+        self._acq_btn_stop.config(state=tk.DISABLED)
 
     def _set_stage_status(self, state: str):
         colours = {
@@ -763,6 +786,7 @@ class OscilloscopeApp:
         self._acq = AcquisitionThread(self._device, self._rate, self._q)
         self._acq.start()
         self._root.after(0, lambda: self._set_ads_status("connected", name))
+        self._root.after(0, self._set_acquiring)
 
     def _ads_on_disconnect(self):
         self._stop_acquisition(close_device=True)
@@ -785,6 +809,45 @@ class OscilloscopeApp:
                 self._q.get_nowait()
             except queue.Empty:
                 break
+
+    def _set_acquiring(self):
+        """Flip Start/Stop buttons to reflect that acquisition is running."""
+        self._acq_btn_start.config(state=tk.DISABLED)
+        self._acq_btn_stop.config(state=tk.NORMAL)
+
+    def _acq_start(self):
+        """Start (or restart) acquisition while keeping the device open."""
+        if self._device is None:
+            return
+        if self._acq is not None:
+            return  # already running
+        self._acq = AcquisitionThread(self._device, self._rate, self._q)
+        self._acq.start()
+        self._set_acquiring()
+
+    def _acq_stop(self):
+        """Stop acquisition without disconnecting the device."""
+        self._stop_acquisition(close_device=False)
+        # Re-enable Start so user can restart
+        self._acq_btn_start.config(state=tk.NORMAL)
+        self._acq_btn_stop.config(state=tk.DISABLED)
+
+    def _clear_graphs(self):
+        """Zero the ring buffer and blank all plot artists."""
+        self._ring.resize(self._calc_history_n())
+        with self._psd_lock:
+            self._freqs1 = np.array([1.0, 2.0])
+            self._psd1   = np.array([1e-9, 1e-9])
+            self._freqs2 = np.array([1.0, 2.0])
+            self._psd2   = np.array([1e-9, 1e-9])
+        n = self._calc_history_n()
+        self._line_ch1.set_ydata(np.zeros(n))
+        self._line_ch2.set_ydata(np.zeros(n))
+        self._line_xy.set_data([], [])
+        self._line_psd1.set_data([], [])
+        self._line_psd2.set_data([], [])
+        self._stat_vt.set_text("")
+        self._canvas.draw_idle()
 
     # =========================================================================
     # Stage connect / disconnect
@@ -983,8 +1046,16 @@ class OscilloscopeApp:
         print(f"[Export] {os.path.abspath(fname)}")
 
     def _export_psd(self):
+        self._acq_stop()
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        fname = f"psd_ch1_ch2_{stamp}.csv"
+        fname = filedialog.asksaveasfilename(
+            title="Export PSD",
+            initialfile=f"psd_ch1_ch2_{stamp}.csv",
+            defaultextension=".csv",
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+        )
+        if not fname:
+            return
         with self._psd_lock:
             f1, p1 = self._freqs1.copy(), self._psd1.copy()
             f2, p2 = self._freqs2.copy(), self._psd2.copy()
@@ -996,13 +1067,21 @@ class OscilloscopeApp:
                 ["frequency_hz", "psd_ch1_v2_per_hz", "psd_ch2_v2_per_hz"],
                 zip(f1, p1, p2),
             )
-            self._flash_export(f"✓ Saved {fname}")
+            self._flash_export(f"✓ Saved {os.path.basename(fname)}")
         except OSError as exc:
             messagebox.showerror("Export Error", str(exc))
 
     def _export_vt(self):
+        self._acq_stop()
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        fname = f"vt_ch1_ch2_{stamp}.csv"
+        fname = filedialog.asksaveasfilename(
+            title="Export V(t)",
+            initialfile=f"vt_ch1_ch2_{stamp}.csv",
+            defaultextension=".csv",
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+        )
+        if not fname:
+            return
         ch1, ch2 = self._ring.view()
         try:
             self._write_csv(
@@ -1010,7 +1089,7 @@ class OscilloscopeApp:
                 ["time_s", "ch1_v", "ch2_v"],
                 zip(self._time_s, ch1, ch2),
             )
-            self._flash_export(f"✓ Saved {fname}")
+            self._flash_export(f"✓ Saved {os.path.basename(fname)}")
         except OSError as exc:
             messagebox.showerror("Export Error", str(exc))
 
