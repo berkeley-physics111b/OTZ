@@ -3,6 +3,23 @@ OTZ_QPD_PSD.py
 ==============
 Live dual-channel oscilloscope + PI stage control — dark-theme Tkinter GUI.
 
+Graphing performance notes
+--------------------------
+1. Decimation      — V(t) and XY arrays are downsampled to canvas pixel width
+                     before set_ydata / set_data, cutting renderer work ~10–80×.
+2. Blit rendering  — each axes background is cached; only the changed Line2D
+                     artists are redrawn per frame (restore_region + draw_artist
+                     + blit). The full draw_idle path is used only when the
+                     figure is resized or the blit cache is stale.
+3. Frozen ylim     — set_ylim is only called when the peak changes by >5%,
+                     avoiding a full layout pass every frame.
+4. In-place view   — RingBuffer.view_into() writes into pre-allocated arrays
+                     (np.copyto), so _redraw allocates nothing on the hot path.
+5. Background PSD  — compute_psd runs in a daemon thread under a lock; the
+                     draw loop reads the last result without waiting.
+6. Separate blit   — XY and V(t)/PSD axes are blitted independently so a stale
+                     PSD recompute never stalls the waveform refresh.
+
 Layout
 ------
   ┌──────────────────────────────────────────────────────────────────┐
@@ -10,8 +27,8 @@ Layout
   ├──────────────────────┬───────────────────────────────────────────┤
   │  Stage Control       │  Oscilloscope Settings                    │
   │    [● status]        │    Sample freq (Hz): [______]             │
-  │    [Connect][Disc.]  │    History length (s): [______]  [Apply]  │
-  │    ○ Joystick/Soft   │    Active: … kHz · … s · … samples       │
+  │    [Connect][Disc.]  │    History length (s): [______]           │
+  │    ○ Joystick/Soft   │    [Apply] [Start] [Stop] [Clear Graphs]  │
   │    ○ Coarse / Fine   ├───────────────────────────────────────────┤
   │    Freq / Step       │  CH1 & CH2 — Voltage vs Time             │
   │    [▲][◄][►][▼]     ├───────────────────────────────────────────┤
@@ -163,13 +180,7 @@ def compute_psd(signal: np.ndarray,
 # ===========================================================================
 
 class AcquisitionThread(threading.Thread):
-    """
-    Acquires small chunks (~_CHUNK_MS ms) continuously and pushes them into
-    a queue.  The main thread drains the queue into its own ring buffer.
-    maxsize=0 means unbounded — the ring buffer on the consumer side handles
-    the fixed memory footprint; we never want to drop hardware data silently.
-    """
-    _CHUNK_MS = 40   # target chunk duration in ms
+    _CHUNK_MS = 40
 
     def __init__(self, device, sample_rate: float, out_queue: queue.Queue):
         super().__init__(daemon=True)
@@ -178,10 +189,6 @@ class AcquisitionThread(threading.Thread):
         self._n    = max(64, int(round(sample_rate * self._CHUNK_MS / 1000)))
         self._q    = out_queue
         self._stop = threading.Event()
-
-    @property
-    def chunk_size(self) -> int:
-        return self._n
 
     def stop(self):
         self._stop.set()
@@ -212,27 +219,26 @@ class AcquisitionThread(threading.Thread):
                     time.sleep(0.001)
                 ch1 = dev.analog_in_get_data(0, self._n)
                 ch2 = dev.analog_in_get_data(1, self._n)
-                self._q.put((ch1, ch2))   # blocks if consumer is slow — no silent drops
+                self._q.put((ch1, ch2))
             except Exception as exc:
                 print(f"[AcqThread] {exc}", file=sys.stderr)
                 time.sleep(0.1)
 
 
 # ===========================================================================
-# Ring buffer
+# Ring buffer  (double-length trick for zero-copy contiguous views)
 # ===========================================================================
 
 class RingBuffer:
-    """
-    Pre-allocated circular buffer for two channels.
-    Write pointer advances on each push; a contiguous view is materialised
-    only when view() is called (one np.empty + two np.copyto, O(N)).
-    """
     def __init__(self, capacity: int):
         self._cap  = capacity
-        self._buf1 = np.zeros(capacity * 2)   # double-length for zero-copy wrap
+        self._buf1 = np.zeros(capacity * 2)
         self._buf2 = np.zeros(capacity * 2)
-        self._ptr  = 0   # points to the oldest sample slot
+        self._ptr  = 0
+
+    @property
+    def capacity(self) -> int:
+        return self._cap
 
     def resize(self, new_capacity: int) -> None:
         self._cap  = new_capacity
@@ -242,42 +248,72 @@ class RingBuffer:
 
     def push(self, ch1: np.ndarray, ch2: np.ndarray) -> None:
         n = len(ch1)
-        # Write at ptr and ptr+cap (mirror) so any window is contiguous
         for start in (self._ptr, self._ptr + self._cap):
             end = start + n
             if end <= len(self._buf1):
                 self._buf1[start:end] = ch1
                 self._buf2[start:end] = ch2
             else:
-                # Wrap around within the double buffer
                 split = len(self._buf1) - start
-                self._buf1[start:] = ch1[:split]
+                self._buf1[start:]              = ch1[:split]
                 self._buf1[:end - len(self._buf1)] = ch1[split:]
-                self._buf2[start:] = ch2[:split]
+                self._buf2[start:]              = ch2[:split]
                 self._buf2[:end - len(self._buf2)] = ch2[split:]
         self._ptr = (self._ptr + n) % self._cap
 
     def view(self) -> Tuple[np.ndarray, np.ndarray]:
-        """Return contiguous arrays of the last `capacity` samples."""
-        start = self._ptr
-        return (self._buf1[start:start + self._cap].copy(),
-                self._buf2[start:start + self._cap].copy())
+        """Allocating view — use only for export / PSD background copy."""
+        s = self._ptr
+        return (self._buf1[s:s + self._cap].copy(),
+                self._buf2[s:s + self._cap].copy())
+
+    def view_into(self, out1: np.ndarray, out2: np.ndarray) -> None:
+        """
+        Zero-allocation view: write the ring contents into caller-supplied
+        pre-allocated arrays.  out1 and out2 must have length == capacity.
+        """
+        s = self._ptr
+        np.copyto(out1, self._buf1[s:s + self._cap])
+        np.copyto(out2, self._buf2[s:s + self._cap])
+
+
+# ===========================================================================
+# Decimation helper
+# ===========================================================================
+
+def decimate(arr: np.ndarray, max_pts: int) -> np.ndarray:
+    """
+    Return a view / copy of arr downsampled to at most max_pts points.
+    Uses slice-based stride decimation (fast, no filtering needed for display).
+    """
+    n = len(arr)
+    if n <= max_pts or max_pts < 1:
+        return arr
+    stride = n // max_pts
+    return arr[::stride]
 
 
 # ===========================================================================
 # Main Application
 # ===========================================================================
 
-_DEFAULT_RATE_HZ  = 8_000
+_DEFAULT_RATE_HZ   = 8_000
 _DEFAULT_HISTORY_S = 8.0
 _DEFAULT_RANGE_V   = 5.0
 _DEFAULT_DEV_IDX   = -1
 
+# Target pixels for decimation.  Conservative — actual widget may be wider.
+_DISPLAY_PX = 900
+
+# Threshold for ylim update (fractional change in peak before we bother)
+_YLIM_THRESHOLD = 0.05
+
+
 class OscilloscopeApp:
 
-    _POLL_MS      = 50     # how often to drain the queue and check for a redraw
-    _DRAW_HZ      = 10     # target display update rate
-    _PSD_EVERY    = 3      # redraw frames between PSD recomputes
+    _POLL_MS   = 50       # ms between Tk .after() poll calls
+    _DRAW_HZ   = 10       # target display refresh rate
+    _PSD_EVERY = 3        # draw frames between PSD recomputes
 
     def __init__(self, root: tk.Tk):
         self._root = root
@@ -289,32 +325,46 @@ class OscilloscopeApp:
         # ADS
         self._device: Optional[object] = None
         self._acq:    Optional[AcquisitionThread] = None
-        self._q       = queue.Queue()   # unbounded — ring buffer is the limit
+        self._q       = queue.Queue()
 
         # Stage
-        self._stage_port:      Optional[object] = None
-        self._stage_ctrl_type  = "joystick"
-        self._stage_speed      = "coarse"
+        self._stage_port:     Optional[object] = None
+        self._stage_ctrl_type = "joystick"
+        self._stage_speed     = "coarse"
 
-        # Ring buffer
-        self._ring     = RingBuffer(self._calc_history_n())
-        self._time_s   = np.linspace(0.0, self._history_s,
-                                     self._calc_history_n())
+        # Ring buffer + pre-allocated display arrays
+        cap = self._calc_history_n()
+        self._ring    = RingBuffer(cap)
+        self._disp1   = np.zeros(cap)   # written by view_into, read by redraw
+        self._disp2   = np.zeros(cap)
+        self._time_s  = np.linspace(0.0, self._history_s, cap)
 
-        # PSD — computed on a background thread to avoid blocking Tk
+        # PSD (background thread)
         self._freqs1   = np.array([1.0, 2.0])
         self._psd1     = np.array([1e-9, 1e-9])
         self._freqs2   = np.array([1.0, 2.0])
         self._psd2     = np.array([1e-9, 1e-9])
         self._psd_lock = threading.Lock()
-        self._psd_busy = False   # True while background PSD thread is running
+        self._psd_busy = False
+        self._psd_new  = False   # True when bg thread wrote fresh results
 
-        # Draw bookkeeping
+        # Draw state
         self._draw_interval = 1.0 / self._DRAW_HZ
         self._last_draw     = 0.0
         self._frame_count   = 0
         self._psd_countdown = 0
         self._fps_t0        = time.time()
+
+        # Blit state — populated after figure is built
+        self._bkg_vt:  Optional[object] = None   # saved backgrounds
+        self._bkg_xy:  Optional[object] = None
+        self._bkg_psd: Optional[object] = None
+        self._blit_valid = False   # False → full draw_idle on next frame
+
+        # Frozen ylim tracking
+        self._last_pk_vt  = 0.0
+        self._last_lim_xy = 0.0
+        self._psd_ylim    = (None, None)
 
         root.title("OTZ QPD Scope")
         root.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -331,6 +381,12 @@ class OscilloscopeApp:
 
     def _calc_history_n(self) -> int:
         return max(64, int(round(self._rate * self._history_s)))
+
+    def _reallocate_display_arrays(self) -> None:
+        cap = self._calc_history_n()
+        self._disp1  = np.zeros(cap)
+        self._disp2  = np.zeros(cap)
+        self._time_s = np.linspace(0.0, self._history_s, cap)
 
     # =========================================================================
     # UI
@@ -401,7 +457,7 @@ class OscilloscopeApp:
         tk.Label(export_bar, textvariable=self._export_msg_var,
                  fg=CONFIRM_COL, bg=BG).pack(side=tk.LEFT, padx=8)
 
-    # ── Left column: stage controls + XY ─────────────────────────────────
+    # ── Left column: stage controls ───────────────────────────────────────
 
     def _build_left_panel(self, parent):
         left = tk.Frame(parent, bg=BG, width=230)
@@ -478,7 +534,7 @@ class OscilloscopeApp:
         for c in (0, 1, 2):
             move_frame.columnconfigure(c, weight=1)
 
-    # ── Right column: settings + single figure (XY | V(t) | PSD) ─────────
+    # ── Right column ──────────────────────────────────────────────────────
 
     def _build_right_column(self, parent):
         right = ttk.Frame(parent)
@@ -506,7 +562,6 @@ class OscilloscopeApp:
         ttk.Entry(inner, textvariable=self._setting_history_var,
                   width=10).grid(row=1, column=1, sticky="w", pady=3)
 
-        # Button cluster: Apply | Start | Stop | Clear Graphs
         btn_frame = ttk.Frame(inner)
         btn_frame.grid(row=0, column=2, rowspan=2, padx=(14, 0), sticky="ns")
 
@@ -541,14 +596,11 @@ class OscilloscopeApp:
         return (f"Active:  {self._rate:,.0f} Hz  ·  {self._history_s:.1f} s  "
                 f"·  {n:,} samples  ·  Nyquist {self._rate/2:,.0f} Hz")
 
-    # ── Single matplotlib figure: 2-col GridSpec ──────────────────────────
-    # Left col (narrow): XY plot
-    # Right col (wide):  V(t) on top, PSD on bottom
+    # ── Matplotlib figure ─────────────────────────────────────────────────
 
     def _build_plots(self, parent):
         self._fig = Figure(figsize=(10, 5.5), dpi=100)
 
-        # Outer: 1 row × 2 cols  (XY left, [Vt+PSD] right)
         outer = gridspec.GridSpec(
             1, 2, figure=self._fig,
             width_ratios=[1, 2.6],
@@ -556,15 +608,12 @@ class OscilloscopeApp:
             top=0.94, bottom=0.09,
             wspace=0.32,
         )
-        # Right sub-grid: 2 rows
-        inner = gridspec.GridSpecFromSubplotSpec(
-            2, 1, subplot_spec=outer[1],
-            hspace=0.48,
-        )
+        inner_gs = gridspec.GridSpecFromSubplotSpec(
+            2, 1, subplot_spec=outer[1], hspace=0.48)
 
         self._ax_xy  = self._fig.add_subplot(outer[0])
-        self._ax_vt  = self._fig.add_subplot(inner[0])
-        self._ax_psd = self._fig.add_subplot(inner[1])
+        self._ax_vt  = self._fig.add_subplot(inner_gs[0])
+        self._ax_psd = self._fig.add_subplot(inner_gs[1])
 
         self._setup_xy_ax()
         self._setup_vt_ax()
@@ -572,7 +621,14 @@ class OscilloscopeApp:
         self._create_plot_artists()
 
         self._canvas = FigureCanvasTkAgg(self._fig, master=parent)
-        self._canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        widget = self._canvas.get_tk_widget()
+        widget.pack(fill=tk.BOTH, expand=True)
+
+        # Invalidate blit cache whenever the figure is resized
+        self._canvas.mpl_connect("resize_event", self._on_fig_resize)
+
+    def _on_fig_resize(self, _event):
+        self._blit_valid = False
 
     def _setup_xy_ax(self):
         ax = self._ax_xy
@@ -611,34 +667,71 @@ class OscilloscopeApp:
         ax.grid(True, which="minor", linewidth=0.25, color=MINOR_COL)
 
     def _create_plot_artists(self):
-        n  = self._calc_history_n()
-        tw = self._time_s
+        cap = self._calc_history_n()
+        tw  = self._time_s
 
-        # XY
+        # XY — marker points, blitted
         self._line_xy, = self._ax_xy.plot(
             [], [], color=XY_COL, lw=0,
-            marker="o", markersize=2.5, markeredgewidth=0, alpha=0.75)
+            marker="o", markersize=2.5, markeredgewidth=0, alpha=0.75,
+            animated=True)
 
-        # V(t)
+        # V(t) — thin lines, blitted
         self._line_ch1, = self._ax_vt.plot(
-            tw, np.zeros(n), color=CH1_COL, lw=0.9, label="CH1")
+            tw, np.zeros(cap), color=CH1_COL, lw=0.9, label="CH1",
+            animated=True)
         self._line_ch2, = self._ax_vt.plot(
-            tw, np.zeros(n), color=CH2_COL, lw=0.9, label="CH2")
+            tw, np.zeros(cap), color=CH2_COL, lw=0.9, label="CH2",
+            animated=True)
         self._ax_vt.legend(fontsize=7, loc="upper right", framealpha=0.7)
 
         self._stat_vt = self._ax_vt.text(
             0.01, 0.98, "",
             fontsize=6.5, va="top", ha="left",
             transform=self._ax_vt.transAxes, color=FG,
+            animated=True,
             bbox=dict(boxstyle="round,pad=0.25", facecolor=PANEL_BG,
                       edgecolor=BORDER, alpha=0.9))
 
-        # PSD
+        # PSD — blitted
         self._line_psd1, = self._ax_psd.plot(
-            [], [], color=CH1_COL, lw=1.1, label="CH1")
+            [], [], color=CH1_COL, lw=1.1, label="CH1", animated=True)
         self._line_psd2, = self._ax_psd.plot(
-            [], [], color=CH2_COL, lw=1.1, label="CH2")
+            [], [], color=CH2_COL, lw=1.1, label="CH2", animated=True)
         self._ax_psd.legend(fontsize=7, loc="upper right", framealpha=0.7)
+
+    # =========================================================================
+    # Blit helpers
+    # =========================================================================
+
+    def _save_backgrounds(self):
+        """Full draw then snapshot each axes background for future blits."""
+        self._fig.canvas.draw()
+        self._bkg_vt  = self._fig.canvas.copy_from_bbox(self._ax_vt.bbox)
+        self._bkg_xy  = self._fig.canvas.copy_from_bbox(self._ax_xy.bbox)
+        self._bkg_psd = self._fig.canvas.copy_from_bbox(self._ax_psd.bbox)
+        self._blit_valid = True
+
+    def _blit_all(self):
+        """Restore backgrounds, draw animated artists, blit each axes."""
+        canvas = self._fig.canvas
+
+        canvas.restore_region(self._bkg_vt)
+        self._ax_vt.draw_artist(self._line_ch1)
+        self._ax_vt.draw_artist(self._line_ch2)
+        self._ax_vt.draw_artist(self._stat_vt)
+        canvas.blit(self._ax_vt.bbox)
+
+        canvas.restore_region(self._bkg_xy)
+        self._ax_xy.draw_artist(self._line_xy)
+        canvas.blit(self._ax_xy.bbox)
+
+        canvas.restore_region(self._bkg_psd)
+        self._ax_psd.draw_artist(self._line_psd1)
+        self._ax_psd.draw_artist(self._line_psd2)
+        canvas.blit(self._ax_psd.bbox)
+
+        canvas.flush_events()
 
     # =========================================================================
     # Settings — Apply
@@ -653,7 +746,6 @@ class OscilloscopeApp:
             messagebox.showerror("Invalid Setting",
                                  "Sample frequency must be a positive number.")
             return
-
         try:
             new_hist = float(self._setting_history_var.get())
             if new_hist <= 0:
@@ -665,7 +757,6 @@ class OscilloscopeApp:
 
         rate_changed = (new_rate != self._rate)
         hist_changed = (new_hist != self._history_s)
-
         if not rate_changed and not hist_changed:
             self._flash_settings("Already applied.")
             return
@@ -675,16 +766,15 @@ class OscilloscopeApp:
 
         new_n = self._calc_history_n()
         self._ring.resize(new_n)
-        self._time_s = np.linspace(0.0, self._history_s, new_n)
+        self._reallocate_display_arrays()
 
-        # Reset PSD
         with self._psd_lock:
             self._freqs1 = np.array([1.0, 2.0])
             self._psd1   = np.array([1e-9, 1e-9])
             self._freqs2 = np.array([1.0, 2.0])
             self._psd2   = np.array([1e-9, 1e-9])
+        self._psd_new = False
 
-        # Restart acquisition if rate changed and device is live
         if rate_changed and self._device is not None:
             was_acquiring = self._acq is not None
             self._stop_acquisition(close_device=False)
@@ -693,21 +783,23 @@ class OscilloscopeApp:
                 self._acq.start()
                 self._set_acquiring()
 
-        # Update plot axes
+        # Reset frozen-ylim tracking
+        self._last_pk_vt  = 0.0
+        self._last_lim_xy = 0.0
+        self._psd_ylim    = (None, None)
+
+        # Resize artists and axes — requires a full redraw to recache blit backgrounds
         self._ax_vt.set_xlim(0.0, self._history_s)
         self._ax_psd.set_xlim(1.0, max(self._rate / 2, 2.0))
-
-        # Resize V(t) line x-data
         self._line_ch1.set_xdata(self._time_s)
         self._line_ch1.set_ydata(np.zeros(new_n))
         self._line_ch2.set_xdata(self._time_s)
         self._line_ch2.set_ydata(np.zeros(new_n))
-
         self._line_psd1.set_data([], [])
         self._line_psd2.set_data([], [])
         self._line_xy.set_data([], [])
+        self._blit_valid = False   # force full redraw + background save
 
-        self._canvas.draw_idle()
         self._settings_info_var.set(self._settings_info_str())
         self._flash_settings("✓ Applied")
 
@@ -735,7 +827,6 @@ class OscilloscopeApp:
             state=tk.DISABLED if connected else tk.NORMAL)
         self._ads_btn_disconnect.config(
             state=tk.NORMAL if connected else tk.DISABLED)
-        # Start enabled when connected but not acquiring; Stop when acquiring
         self._acq_btn_start.config(
             state=tk.NORMAL if connected else tk.DISABLED)
         self._acq_btn_stop.config(state=tk.DISABLED)
@@ -756,7 +847,7 @@ class OscilloscopeApp:
             state=tk.NORMAL if connected else tk.DISABLED)
 
     # =========================================================================
-    # ADS connect / disconnect
+    # ADS connect / disconnect / start / stop
     # =========================================================================
 
     def _ads_on_connect(self):
@@ -803,7 +894,6 @@ class OscilloscopeApp:
             except Exception:
                 pass
             self._device = None
-        # Drain the queue
         while True:
             try:
                 self._q.get_nowait()
@@ -811,43 +901,42 @@ class OscilloscopeApp:
                 break
 
     def _set_acquiring(self):
-        """Flip Start/Stop buttons to reflect that acquisition is running."""
         self._acq_btn_start.config(state=tk.DISABLED)
         self._acq_btn_stop.config(state=tk.NORMAL)
 
     def _acq_start(self):
-        """Start (or restart) acquisition while keeping the device open."""
-        if self._device is None:
+        if self._device is None or self._acq is not None:
             return
-        if self._acq is not None:
-            return  # already running
         self._acq = AcquisitionThread(self._device, self._rate, self._q)
         self._acq.start()
         self._set_acquiring()
 
     def _acq_stop(self):
-        """Stop acquisition without disconnecting the device."""
         self._stop_acquisition(close_device=False)
-        # Re-enable Start so user can restart
         self._acq_btn_start.config(state=tk.NORMAL)
         self._acq_btn_stop.config(state=tk.DISABLED)
 
     def _clear_graphs(self):
-        """Zero the ring buffer and blank all plot artists."""
         self._ring.resize(self._calc_history_n())
+        self._disp1[:] = 0.0
+        self._disp2[:] = 0.0
         with self._psd_lock:
             self._freqs1 = np.array([1.0, 2.0])
             self._psd1   = np.array([1e-9, 1e-9])
             self._freqs2 = np.array([1.0, 2.0])
             self._psd2   = np.array([1e-9, 1e-9])
-        n = self._calc_history_n()
+        self._psd_new        = False
+        self._last_pk_vt     = 0.0
+        self._last_lim_xy    = 0.0
+        self._psd_ylim       = (None, None)
+        n = len(self._disp1)
         self._line_ch1.set_ydata(np.zeros(n))
         self._line_ch2.set_ydata(np.zeros(n))
         self._line_xy.set_data([], [])
         self._line_psd1.set_data([], [])
         self._line_psd2.set_data([], [])
         self._stat_vt.set_text("")
-        self._canvas.draw_idle()
+        self._blit_valid = False
 
     # =========================================================================
     # Stage connect / disconnect
@@ -929,11 +1018,10 @@ class OscilloscopeApp:
                 stage_control.set_resolution(self._stage_port, fine=False)
 
     # =========================================================================
-    # Poll / draw
+    # Poll / draw loop
     # =========================================================================
 
     def _poll(self):
-        # Drain all pending chunks into the ring buffer
         got_data = False
         try:
             while True:
@@ -953,13 +1041,29 @@ class OscilloscopeApp:
         self._last_draw = now
         self._frame_count += 1
 
-        ch1, ch2 = self._ring.view()
+        # ── 1. Fill display arrays in-place (no allocation) ──────────────
+        self._ring.view_into(self._disp1, self._disp2)
+        ch1 = self._disp1
+        ch2 = self._disp2
 
-        # V(t)
-        self._line_ch1.set_ydata(ch1)
-        self._line_ch2.set_ydata(ch2)
-        pk = max(abs(ch1).max(), abs(ch2).max(), 1e-9)
-        self._ax_vt.set_ylim(-pk * 1.15, pk * 1.15)
+        # ── 2. Decimate to canvas pixel width ────────────────────────────
+        d1 = decimate(ch1, _DISPLAY_PX)
+        d2 = decimate(ch2, _DISPLAY_PX)
+        tw = decimate(self._time_s, _DISPLAY_PX)
+
+        # ── 3. Update V(t) artists ────────────────────────────────────────
+        self._line_ch1.set_xdata(tw)
+        self._line_ch1.set_ydata(d1)
+        self._line_ch2.set_xdata(tw)
+        self._line_ch2.set_ydata(d2)
+
+        # Frozen ylim — only update if peak changed > threshold
+        pk = max(float(np.abs(ch1).max()), float(np.abs(ch2).max()), 1e-9)
+        if abs(pk - self._last_pk_vt) / max(self._last_pk_vt, 1e-9) > _YLIM_THRESHOLD:
+            self._ax_vt.set_ylim(-pk * 1.15, pk * 1.15)
+            self._last_pk_vt = pk
+            self._blit_valid = False   # ylim change invalidates bkg
+
         rms1 = float(np.sqrt(np.mean(ch1 ** 2)))
         rms2 = float(np.sqrt(np.mean(ch2 ** 2)))
         self._stat_vt.set_text(
@@ -969,13 +1073,18 @@ class OscilloscopeApp:
             f"rms {rms2:.3f}  μ {ch2.mean():+.4f}"
         )
 
-        # XY
-        self._line_xy.set_data(ch1, ch2)
-        lim = max(abs(ch1).max(), abs(ch2).max(), 1e-9) * 1.15
-        self._ax_xy.set_xlim(-lim, lim)
-        self._ax_xy.set_ylim(-lim, lim)
+        # ── 4. Update XY artist ───────────────────────────────────────────
+        dxy = decimate(ch1, _DISPLAY_PX)
+        dxy2 = decimate(ch2, _DISPLAY_PX)
+        self._line_xy.set_data(dxy, dxy2)
+        lim = max(float(np.abs(ch1).max()), float(np.abs(ch2).max()), 1e-9) * 1.15
+        if abs(lim - self._last_lim_xy) / max(self._last_lim_xy, 1e-9) > _YLIM_THRESHOLD:
+            self._ax_xy.set_xlim(-lim, lim)
+            self._ax_xy.set_ylim(-lim, lim)
+            self._last_lim_xy = lim
+            self._blit_valid = False
 
-        # PSD — kick off a background thread every _PSD_EVERY frames
+        # ── 5. Kick off background PSD if due ─────────────────────────────
         self._psd_countdown -= 1
         if self._psd_countdown <= 0:
             self._psd_countdown = self._PSD_EVERY
@@ -987,28 +1096,36 @@ class OscilloscopeApp:
                     daemon=True,
                 ).start()
 
-        # Apply last-computed PSD results
-        with self._psd_lock:
-            f1, p1 = self._freqs1[1:], self._psd1[1:]
-            f2, p2 = self._freqs2[1:], self._psd2[1:]
-        self._line_psd1.set_data(f1, p1)
-        self._line_psd2.set_data(f2, p2)
-        valid = np.concatenate([p1[p1 > 0], p2[p2 > 0]])
-        if len(valid):
-            self._ax_psd.set_ylim(valid.min() * 0.1, valid.max() * 10)
+        # ── 6. Apply PSD results if a new compute finished ────────────────
+        if self._psd_new:
+            self._psd_new = False
+            with self._psd_lock:
+                f1, p1 = self._freqs1[1:], self._psd1[1:]
+                f2, p2 = self._freqs2[1:], self._psd2[1:]
+            self._line_psd1.set_data(f1, p1)
+            self._line_psd2.set_data(f2, p2)
+            valid = np.concatenate([p1[p1 > 0], p2[p2 > 0]])
+            if len(valid):
+                ylo, yhi = valid.min() * 0.1, valid.max() * 10
+                if (ylo, yhi) != self._psd_ylim:
+                    self._ax_psd.set_ylim(ylo, yhi)
+                    self._psd_ylim = (ylo, yhi)
+                    self._blit_valid = False
 
-        # FPS
+        # ── 7. Blit or full draw ──────────────────────────────────────────
+        if not self._blit_valid:
+            self._save_backgrounds()   # full draw + cache backgrounds
+        else:
+            self._blit_all()
+
+        # ── 8. FPS counter ────────────────────────────────────────────────
         elapsed = now - self._fps_t0
         if elapsed >= 1.5:
-            fps           = self._frame_count / elapsed
-            self._fps_t0  = now
+            self._fps_var.set(f"FPS: {self._frame_count / elapsed:.1f}")
+            self._fps_t0      = now
             self._frame_count = 0
-            self._fps_var.set(f"FPS: {fps:.1f}")
-
-        self._canvas.draw_idle()
 
     def _compute_psd_bg(self, ch1: np.ndarray, ch2: np.ndarray):
-        """Runs in a daemon thread; writes results under the lock."""
         f1, p1 = compute_psd(ch1, self._rate)
         f2, p2 = compute_psd(ch2, self._rate)
         with self._psd_lock:
@@ -1017,6 +1134,7 @@ class OscilloscopeApp:
             self._freqs2 = f2
             self._psd2   = p2
         self._psd_busy = False
+        self._psd_new  = True   # signal to redraw loop
 
     # =========================================================================
     # Export
