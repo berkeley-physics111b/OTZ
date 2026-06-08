@@ -662,7 +662,7 @@ class WaveFormsADS:
 
         Returns
         -------
-        np.ndarray  – float64 voltage samples (may be shorter than requested
+        np.ndarray  - float64 voltage samples (may be shorter than requested
                       if data loss occurred; a warning is printed).
         """
         if timeout_s is None:
