@@ -610,6 +610,34 @@ class WaveFormsADS:
             time.sleep(0.001)
 
         return self.analog_in_get_data(channel, buffer_size)
+    
+    def analog_in_capture_multiple(
+        self,
+        channel_settings: dict,
+        sample_rate_hz: float = 1e6,
+        buffer_size: int = 4096,
+        trigger_level_v: Optional[float] = None,
+        trigger_channel: Optional[int] = None,
+        trigger_condition: int = DwfTriggerSlopeRise,
+        auto_timeout_s: float = 1.0,
+        timeout_s: float = 5.0,
+    ) -> dict:
+        """More generalized version of analog in capture for easy settings for multiple channels.
+
+        Args:
+            channel_settings (dict): _description_
+            sample_rate_hz (float, optional): _description_. Defaults to 1e6.
+            buffer_size (int, optional): _description_. Defaults to 4096.
+            trigger_level_v (Optional[float], optional): _description_. Defaults to None.
+            trigger_channel (Optional[int], optional): _description_. Defaults to None.
+            trigger_condition (int, optional): _description_. Defaults to DwfTriggerSlopeRise.
+            auto_timeout_s (float, optional): _description_. Defaults to 1.0.
+            timeout_s (float, optional): _description_. Defaults to 5.0.
+
+        Returns:
+            dict: _description_
+        """
+        ...
 
     def analog_in_record(
         self,
