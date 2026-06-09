@@ -295,7 +295,7 @@ def decimate(arr: np.ndarray, max_pts: int) -> np.ndarray:
 
 _DEFAULT_RATE_HZ   = 8_000
 _DEFAULT_HISTORY_S = 8.0
-_DEFAULT_RANGE_V   = 5.0
+_DEFAULT_RANGE_V   = 0.5
 _DEFAULT_DEV_IDX   = -1
 
 # Target pixels for decimation.  Conservative — actual widget may be wider.
@@ -328,9 +328,13 @@ class OscilloscopeApp:
         # Ring buffer + pre-allocated display arrays
         cap = self._calc_history_n()
         self._ring    = RingBuffer(cap)
-        self._disp1   = np.zeros(cap)   # written by view_into, read by redraw
+        self._disp1   = np.zeros(cap)
         self._disp2   = np.zeros(cap)
         self._time_s  = np.linspace(0.0, self._history_s, cap)
+
+        # Most-recent acquisition chunk — used for XY display
+        self._last_chunk1: np.ndarray = np.zeros(1)
+        self._last_chunk2: np.ndarray = np.zeros(1)
 
         # PSD (background thread)
         self._freqs1   = np.array([1.0, 2.0])
@@ -662,7 +666,7 @@ class OscilloscopeApp:
         # XY
         self._line_xy, = self._ax_xy.plot(
             [], [], color=XY_COL, lw=0,
-            marker=".", markersize=2.5, markeredgewidth=0, alpha=1)
+            marker=".", markersize=3)
 
         # V(t)
         self._line_ch1, = self._ax_vt.plot(
@@ -904,6 +908,8 @@ class OscilloscopeApp:
         n = len(self._disp1)
         self._line_ch1.set_ydata(np.zeros(n))
         self._line_ch2.set_ydata(np.zeros(n))
+        self._last_chunk1 = np.zeros(1)
+        self._last_chunk2 = np.zeros(1)
         self._line_xy.set_data([], [])
         self._line_psd1.set_data([], [])
         self._line_psd2.set_data([], [])
@@ -999,6 +1005,8 @@ class OscilloscopeApp:
             while True:
                 ch1_chunk, ch2_chunk = self._q.get_nowait()
                 self._ring.push(ch1_chunk, ch2_chunk)
+                self._last_chunk1 = ch1_chunk
+                self._last_chunk2 = ch2_chunk
                 got_data = True
         except queue.Empty:
             pass
@@ -1038,9 +1046,8 @@ class OscilloscopeApp:
             f"rms {rms2:.3f}  μ {ch2.mean():+.4f}"
         )
 
-        # ── 4. Update XY artist (xlim/ylim fixed to input range) ─────────
-        self._line_xy.set_data(decimate(ch1, _DISPLAY_PX),
-                               decimate(ch2, _DISPLAY_PX))
+        # ── 4. Update XY artist (latest chunk only — no history trail) ────
+        self._line_xy.set_data(self._last_chunk1, self._last_chunk2)
 
         # ── 5. Kick off background PSD if due ─────────────────────────────
         self._psd_countdown -= 1
