@@ -662,7 +662,7 @@ class OscilloscopeApp:
         # XY
         self._line_xy, = self._ax_xy.plot(
             [], [], color=XY_COL, lw=0,
-            marker="o", markersize=2.5, markeredgewidth=0, alpha=0.75)
+            marker=".", markersize=2.5, markeredgewidth=0, alpha=1)
 
         # V(t)
         self._line_ch1, = self._ax_vt.plot(
