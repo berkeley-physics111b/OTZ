@@ -11,8 +11,10 @@ Graphing performance notes
                      artists are redrawn per frame (restore_region + draw_artist
                      + blit). The full draw_idle path is used only when the
                      figure is resized or the blit cache is stale.
-3. Frozen ylim     — set_ylim is only called when the peak changes by >5%,
-                     avoiding a full layout pass every frame.
+3. Fixed ylim       — V(t) and XY ylims are set once from the input range
+                     setting and never changed at runtime, eliminating the
+                     main source of blit-cache invalidation and flicker.
+                     PSD ylim snaps to log decades so it changes rarely.
 4. In-place view   — RingBuffer.view_into() writes into pre-allocated arrays
                      (np.copyto), so _redraw allocates nothing on the hot path.
 5. Background PSD  — compute_psd runs in a daemon thread under a lock; the
@@ -299,14 +301,11 @@ def decimate(arr: np.ndarray, max_pts: int) -> np.ndarray:
 
 _DEFAULT_RATE_HZ   = 8_000
 _DEFAULT_HISTORY_S = 8.0
-_DEFAULT_RANGE_V   = 5.0
+_DEFAULT_RANGE_V   = 2.0
 _DEFAULT_DEV_IDX   = -1
 
 # Target pixels for decimation.  Conservative — actual widget may be wider.
 _DISPLAY_PX = 900
-
-# Threshold for ylim update (fractional change in peak before we bother)
-_YLIM_THRESHOLD = 0.05
 
 
 class OscilloscopeApp:
@@ -356,16 +355,14 @@ class OscilloscopeApp:
         self._fps_t0        = time.time()
 
         # Blit state — populated after figure is built
-        self._bkg_vt:   Optional[object] = None   # saved backgrounds
+        self._bkg_vt:   Optional[object] = None
         self._bkg_xy:   Optional[object] = None
         self._bkg_psd:  Optional[object] = None
-        self._blit_valid   = False   # False → backgrounds need saving
-        self._blit_pending = False   # True → _save_backgrounds already scheduled
+        self._blit_valid   = False
+        self._blit_pending = False
 
-        # Frozen ylim tracking
-        self._last_pk_vt  = 0.0
-        self._last_lim_xy = 0.0
-        self._psd_ylim    = (None, None)
+        # PSD ylim: track last snapped decade bounds to avoid redundant saves
+        self._psd_ylim = (None, None)
 
         root.title("OTZ QPD Scope")
         root.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -636,9 +633,9 @@ class OscilloscopeApp:
         ax.set_title("XY — CH2 vs CH1", pad=3)
         ax.set_xlabel("CH1 (V)", labelpad=1)
         ax.set_ylabel("CH2 (V)", labelpad=1)
-        lim = self._range / 2 * 1.15
-        ax.set_xlim(-lim, lim)
-        ax.set_ylim(-lim, lim)
+        half = self._range / 2.0
+        ax.set_xlim(-half, half)
+        ax.set_ylim(-half, half)
         ax.set_aspect("equal", adjustable="box")
 
     def _setup_vt_ax(self):
@@ -647,7 +644,8 @@ class OscilloscopeApp:
         ax.set_xlabel("Time (s)", labelpad=1)
         ax.set_ylabel("Voltage (V)", labelpad=1)
         ax.set_xlim(0.0, self._history_s)
-        ax.set_ylim(-self._range / 2 * 1.15, self._range / 2 * 1.15)
+        half = self._range / 2.0
+        ax.set_ylim(-half, half)
         ax.minorticks_on()
         ax.grid(True, which="minor", linewidth=0.25, color=MINOR_COL)
 
@@ -797,10 +795,8 @@ class OscilloscopeApp:
                 self._acq.start()
                 self._set_acquiring()
 
-        # Reset frozen-ylim tracking
-        self._last_pk_vt  = 0.0
-        self._last_lim_xy = 0.0
-        self._psd_ylim    = (None, None)
+        # Reset PSD ylim tracking
+        self._psd_ylim = (None, None)
 
         # Resize artists and axes — requires a full redraw to recache blit backgrounds
         self._ax_vt.set_xlim(0.0, self._history_s)
@@ -941,10 +937,8 @@ class OscilloscopeApp:
             self._psd1   = np.array([1e-9, 1e-9])
             self._freqs2 = np.array([1.0, 2.0])
             self._psd2   = np.array([1e-9, 1e-9])
-        self._psd_new        = False
-        self._last_pk_vt     = 0.0
-        self._last_lim_xy    = 0.0
-        self._psd_ylim       = (None, None)
+        self._psd_new  = False
+        self._psd_ylim = (None, None)
         n = len(self._disp1)
         self._line_ch1.set_ydata(np.zeros(n))
         self._line_ch2.set_ydata(np.zeros(n))
@@ -1067,18 +1061,11 @@ class OscilloscopeApp:
         d2 = decimate(ch2, _DISPLAY_PX)
         tw = decimate(self._time_s, _DISPLAY_PX)
 
-        # ── 3. Update V(t) artists ────────────────────────────────────────
+        # ── 3. Update V(t) artists (ylim fixed to input range — no rescale) ──
         self._line_ch1.set_xdata(tw)
         self._line_ch1.set_ydata(d1)
         self._line_ch2.set_xdata(tw)
         self._line_ch2.set_ydata(d2)
-
-        # Frozen ylim — only update if peak changed > threshold
-        pk = max(float(np.abs(ch1).max()), float(np.abs(ch2).max()), 1e-9)
-        if abs(pk - self._last_pk_vt) / max(self._last_pk_vt, 1e-9) > _YLIM_THRESHOLD:
-            self._ax_vt.set_ylim(-pk * 1.15, pk * 1.15)
-            self._last_pk_vt = pk
-            self._schedule_background_save()
 
         rms1 = float(np.sqrt(np.mean(ch1 ** 2)))
         rms2 = float(np.sqrt(np.mean(ch2 ** 2)))
@@ -1089,16 +1076,9 @@ class OscilloscopeApp:
             f"rms {rms2:.3f}  μ {ch2.mean():+.4f}"
         )
 
-        # ── 4. Update XY artist ───────────────────────────────────────────
-        dxy = decimate(ch1, _DISPLAY_PX)
-        dxy2 = decimate(ch2, _DISPLAY_PX)
-        self._line_xy.set_data(dxy, dxy2)
-        lim = max(float(np.abs(ch1).max()), float(np.abs(ch2).max()), 1e-9) * 1.15
-        if abs(lim - self._last_lim_xy) / max(self._last_lim_xy, 1e-9) > _YLIM_THRESHOLD:
-            self._ax_xy.set_xlim(-lim, lim)
-            self._ax_xy.set_ylim(-lim, lim)
-            self._last_lim_xy = lim
-            self._schedule_background_save()
+        # ── 4. Update XY artist (xlim/ylim fixed to input range) ─────────
+        self._line_xy.set_data(decimate(ch1, _DISPLAY_PX),
+                               decimate(ch2, _DISPLAY_PX))
 
         # ── 5. Kick off background PSD if due ─────────────────────────────
         self._psd_countdown -= 1
@@ -1120,17 +1100,17 @@ class OscilloscopeApp:
                 f2, p2 = self._freqs2[1:], self._psd2[1:]
             self._line_psd1.set_data(f1, p1)
             self._line_psd2.set_data(f2, p2)
+            # Snap PSD ylim to nearest log decade to minimise background saves
             valid = np.concatenate([p1[p1 > 0], p2[p2 > 0]])
             if len(valid):
-                ylo, yhi = valid.min() * 0.1, valid.max() * 10
+                ylo = 10 ** np.floor(np.log10(valid.min()) - 1)
+                yhi = 10 ** np.ceil( np.log10(valid.max()) + 1)
                 if (ylo, yhi) != self._psd_ylim:
                     self._ax_psd.set_ylim(ylo, yhi)
                     self._psd_ylim = (ylo, yhi)
                     self._schedule_background_save()
 
         # ── 7. Blit if backgrounds are ready, otherwise skip this frame ───
-        # Skipping (rather than doing a full draw) means the transition into
-        # and out of a background-save is invisible — no flash.
         if self._blit_valid:
             self._blit_all()
 
