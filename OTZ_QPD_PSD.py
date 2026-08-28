@@ -767,7 +767,8 @@ class OscilloscopeApp:
                 self._device.analog_in_set_range(0, self._range)
                 self._device.analog_in_set_range(1, self._range)
             except Exception as exc:
-                print(f"[Settings] ADS range update failed: {exc}", file=sys.stderr)
+                err = str(exc)
+                print(f"[Settings] ADS range update failed: {err}", file=sys.stderr)
 
         # Restart acquisition thread if sample rate changed
         if rate_changed and self._device is not None:
@@ -848,9 +849,10 @@ class OscilloscopeApp:
             self._device = dev
             name = str(dev)
         except Exception as exc:
+            err = str(exc)
             self._root.after(0, lambda: self._set_ads_status("disconnected"))
             self._root.after(0, lambda: messagebox.showerror(
-                "ADS Connection Failed", str(exc)))
+                "ADS Connection Failed", err))
             return
         self._acq = AcquisitionThread(self._device, self._rate, self._q)
         self._acq.start()
@@ -930,9 +932,10 @@ class OscilloscopeApp:
             stage_control.init_stage(port)
             self._stage_port = port
         except Exception as exc:
+            err = str(exc)
             self._root.after(0, lambda: self._set_stage_status("disconnected"))
             self._root.after(0, lambda: messagebox.showerror(
-                "Stage Connection Failed", str(exc)))
+                "Stage Connection Failed", err))
             return
         self._root.after(0, lambda: self._set_stage_status("connected"))
 
